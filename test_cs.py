@@ -148,15 +148,28 @@ def kc_setup(home, fake):
         os.chmod(SECURITY, 0o755)
         KC_ENV = dict(os.environ, CS_FAKE_KEYCHAIN=KC_DB)
     else:
-        SECURITY, KC_DB, KC_ENV = 'security', None, dict(os.environ)
+        # The real security tool keeps its keychain list under $HOME, and cs runs with HOME=<fake home> — so give that
+        # home a throw-away keychain of its own. The user's login keychain is never touched.
+        SECURITY, KC_DB, KC_ENV = 'security', None, dict(os.environ, HOME=home)
+        os.makedirs(os.path.join(home, 'Library', 'Keychains'), exist_ok=True)
+        sec('create-keychain', '-p', '', KC_FILE, check=True)
+        sec('set-keychain-settings', KC_FILE, check=True)   # no auto-lock
+        sec('unlock-keychain', '-p', '', KC_FILE, check=True)
+        sec('list-keychains', '-d', 'user', '-s', KC_FILE, check=True)
+        sec('default-keychain', '-d', 'user', '-s', KC_FILE, check=True)
     atexit.register(kc_cleanup)
 
 
+KC_FILE = 'cs-test.keychain-db'
+
+
 def kc_cleanup():
-    """Remove the test item from a real keychain, whatever happened."""
+    """Remove the test item and the throw-away keychain, whatever happened."""
     if STORE == 'keychain' and KC_DB is None:
         with contextlib.suppress(Exception):
             sec('delete-generic-password', '-a', KC_ACCOUNT, '-s', KC_SERVICE)
+        with contextlib.suppress(Exception):
+            sec('delete-keychain', KC_FILE)
 
 
 def sec(*args, check=False):
@@ -1305,6 +1318,7 @@ print('Login successful.')
     srv.shutdown()
     if STORE == 'keychain':
         cred_delete(home)
+        kc_cleanup()
     shutil.rmtree(home, ignore_errors=True)
     print()
     print('FAIL:', FAILS) if FAILS else print('all passed')
