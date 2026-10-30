@@ -70,7 +70,7 @@ def capture(home, base, cols=118, rows=34):
     t.finish()
     end = raw.rfind('\x1b[J')
     start = raw.rfind('\x1b[H', 0, end)
-    return raw[start + 3:end].replace('\x1b[K', '')
+    return raw[start + 3:end].replace('\x1b[K', '').replace('\r', '')  # the pty turns \n into \r\n
 
 
 SGR = re.compile(r'\x1b\[([0-9;]*)m')
@@ -123,7 +123,7 @@ def paint(frame, out_path, size=15):
             for ch in text:
                 if bg:
                     d.rectangle([x, y - 2, x + cw, y + lh - 2], fill=bg)
-                f = fallback if ch in '⚠' else font
+                f = fallback if ch in '⚠※' else font  # glyphs DejaVu Sans Mono lacks
                 d.text((x, y), ch, font=f, fill=fg)
                 x += cw
     img.save(out_path)
