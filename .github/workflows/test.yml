@@ -29,14 +29,24 @@ jobs:
       - run: python3 -I test_cs.py --store keychain --fake-security
 
   macos:
-    # macOS: the real security tool (the test suite creates a throw-away keychain inside its fake HOME), on the
-    # Python that ships with the Xcode command line tools
+    # macOS: the real security tool with a throw-away keychain as the default, on the Python that ships with the
+    # Xcode command line tools
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - run: brew install tmux
+      - name: Create a temporary keychain and make it the default
+        run: |
+          security create-keychain -p "" cs-test.keychain-db
+          security set-keychain-settings cs-test.keychain-db
+          security unlock-keychain -p "" cs-test.keychain-db
+          security list-keychains -d user -s cs-test.keychain-db $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s cs-test.keychain-db
       - name: Test with the system python3 (3.9) and the real security tool
         run: |
           PY=/usr/bin/python3; [ -x "$PY" ] || PY=python3
           "$PY" --version
           "$PY" -I test_cs.py --store keychain --real-security
+      - name: Remove the temporary keychain
+        if: always()
+        run: security delete-keychain cs-test.keychain-db || true

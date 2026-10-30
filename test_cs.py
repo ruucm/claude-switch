@@ -148,28 +148,18 @@ def kc_setup(home, fake):
         os.chmod(SECURITY, 0o755)
         KC_ENV = dict(os.environ, CS_FAKE_KEYCHAIN=KC_DB)
     else:
-        # The real security tool keeps its keychain list under $HOME, and cs runs with HOME=<fake home> — so give that
-        # home a throw-away keychain of its own. The user's login keychain is never touched.
-        SECURITY, KC_DB, KC_ENV = 'security', None, dict(os.environ, HOME=home)
-        os.makedirs(os.path.join(home, 'Library', 'Keychains'), exist_ok=True)
-        sec('create-keychain', '-p', '', KC_FILE, check=True)
-        sec('set-keychain-settings', KC_FILE, check=True)   # no auto-lock
-        sec('unlock-keychain', '-p', '', KC_FILE, check=True)
-        sec('list-keychains', '-d', 'user', '-s', KC_FILE, check=True)
-        sec('default-keychain', '-d', 'user', '-s', KC_FILE, check=True)
+        # The real security tool: the item lives in the user's default keychain under the test-only service name above
+        # (CI puts a throw-away keychain in front, see .github/workflows/test.yml). The tool finds its keychains through
+        # $HOME, so cs then runs with the real HOME and is isolated by CLAUDE_CONFIG_DIR and CS_VAULT_DIR instead.
+        SECURITY, KC_DB, KC_ENV = 'security', None, dict(os.environ)
     atexit.register(kc_cleanup)
 
 
-KC_FILE = 'cs-test.keychain-db'
-
-
 def kc_cleanup():
-    """Remove the test item and the throw-away keychain, whatever happened."""
+    """Remove the test item from a real keychain, whatever happened."""
     if STORE == 'keychain' and KC_DB is None:
         with contextlib.suppress(Exception):
             sec('delete-generic-password', '-a', KC_ACCOUNT, '-s', KC_SERVICE)
-        with contextlib.suppress(Exception):
-            sec('delete-keychain', KC_FILE)
 
 
 def sec(*args, check=False):
@@ -548,9 +538,12 @@ print('Login successful.')
     env = dict(os.environ, HOME=home, CS_API_BASE=base, CS_TOKEN_URL=base + '/v1/oauth/token',
                CS_CLAUDE_BIN=fake, CS_LOCK_WAIT='2', NO_COLOR='1', CS_CRED_STORE=STORE)
     if STORE == 'keychain':  # the CLI with CLAUDE_CONFIG_DIR set: .claude.json and the locks move there, the keychain service gets a suffix
-        env.update(CLAUDE_CONFIG_DIR=os.path.join(home, '.claude'), CS_SECURITY_BIN=SECURITY)
+        env.update(CLAUDE_CONFIG_DIR=os.path.join(home, '.claude'), CS_SECURITY_BIN=SECURITY,
+                   CS_VAULT_DIR=os.path.join(home, '.claude-accounts'))
         if KC_DB:
             env['CS_FAKE_KEYCHAIN'] = KC_DB
+        elif os.environ.get('HOME'):
+            env['HOME'] = os.environ['HOME']  # the real security tool looks for its keychains under $HOME
     cred_file = os.path.join(home, '.claude', '.credentials.json')
     outputs = []
 
