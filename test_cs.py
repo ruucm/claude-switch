@@ -3,15 +3,21 @@
 User-Agent check · per-token organizations · per-account reset times · usage call counting · 429 + Retry-After).
 The real login files are never touched.
 
-  python3 test_cs.py
+  python3 -I test_cs.py                    # the platform's login store: the file on Linux, the keychain on macOS
+  python3 -I test_cs.py --store keychain   # the keychain path anywhere (on Linux through a stand-in for the security tool)
+  python3 -I test_cs.py --store file       # the file path on macOS
+  --fake-security / --real-security        # use the stand-in / the real security tool in keychain mode
 """
+import atexit
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
 import pty
+import pwd
 import re
 import secrets
 import select
@@ -31,6 +37,181 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CS = os.path.join(HERE, 'cs.py')
 A, B = 'first.jay@example.com', 'first.joe@example.com'
 ORG_T = '7c1e2f0a-1111-4222-8333-944455556666'  # team organization that jay's email also belongs to
+
+# Login store under test (set by main): 'file' = <home>/.claude/.credentials.json · 'keychain' = the macOS keychain item,
+# addressed exactly like the CLI does with CLAUDE_CONFIG_DIR=<home>/.claude (service "Claude Code-credentials-<hash>").
+STORE = 'file'
+SECURITY = 'security'   # the security tool the keychain helpers call — the real one on macOS, fake_security.py elsewhere
+KC_SERVICE = KC_ACCOUNT = KC_DB = None
+KC_ENV = dict(os.environ)
+
+FAKE_SECURITY = '''#!%s
+"""Stand-in for the macOS security tool (generic-password subset) backed by one JSON file; exit codes match the real one."""
+import fcntl, json, os, shlex, sys
+DB = os.environ['CS_FAKE_KEYCHAIN']
+NOT_FOUND = 'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\\n'
+LOCKED = 'security: SecKeychainItemCreateFromContent: User interaction is not allowed.\\n'
+
+
+def load():
+    try:
+        with open(DB) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {'items': {}}
+
+
+def save(d):
+    with open(DB + '.tmp', 'w') as f:
+        json.dump(d, f)
+    os.replace(DB + '.tmp', DB)
+
+
+def opts(args):
+    o, i = {}, 0
+    while i < len(args):
+        a = args[i]
+        if a in ('-U', '-w'):
+            o[a] = True
+            i += 1
+        elif a in ('-a', '-s', '-X', '-l', '-j', '-k'):
+            o[a] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    return o
+
+
+def run(cmd, args, via):
+    if os.path.exists(DB + '.locked'):
+        sys.stderr.write(LOCKED)
+        return 36
+    o = opts(args)
+    key = o.get('-s', '') + chr(0) + o.get('-a', '')
+    with open(DB + '.lock', 'w') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = load()
+        if cmd == 'find-generic-password':
+            it = d['items'].get(key)
+            if it is None:
+                sys.stderr.write(NOT_FOUND)
+                return 44
+            sys.stdout.write(it['text'] + '\\n' if '-w' in o else 'keychain: "login.keychain-db"\\n    "svce"<blob>="%%s"\\n' %% o.get('-s', ''))
+            return 0
+        if cmd == 'add-generic-password':
+            if key in d['items'] and '-U' not in o:
+                sys.stderr.write('security: SecKeychainItemCreateFromContent: The specified item already exists in the keychain.\\n')
+                return 45
+            d['items'][key] = {'text': bytes.fromhex(o['-X']).decode('utf-8'), 'via': via}
+            d['last_write_via'] = via
+            save(d)
+            return 0
+        if cmd == 'delete-generic-password':
+            if d['items'].pop(key, None) is None:
+                sys.stderr.write(NOT_FOUND)
+                return 44
+            save(d)
+            return 0
+        sys.stderr.write('security: unknown command "%%s"\\n' %% cmd)
+        return 1
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:1] == ['-i']:  # interactive mode: one command per stdin line, like the CLI uses it
+        rc = 0
+        for line in sys.stdin.read().splitlines():
+            parts = shlex.split(line)
+            if parts:
+                rc = run(parts[0], parts[1:], 'stdin')
+        return rc
+    return run(argv[0], argv[1:], 'argv') if argv else 1
+
+
+sys.exit(main())
+'''
+
+
+def kc_setup(home, fake):
+    """Keychain mode: the service name the CLI derives from CLAUDE_CONFIG_DIR=<home>/.claude, the account name, and the
+    security tool — the real one, or the stand-in written into the fake home."""
+    global SECURITY, KC_SERVICE, KC_ACCOUNT, KC_DB, KC_ENV
+    cfg = os.path.join(home, '.claude')
+    KC_SERVICE = 'Claude Code-credentials-' + hashlib.sha256(cfg.encode('utf-8')).hexdigest()[:8]
+    name = os.environ.get('USER') or pwd.getpwuid(os.getuid()).pw_name
+    KC_ACCOUNT = name if re.fullmatch(r'[a-zA-Z0-9._-]+', name) else 'claude-code-user'
+    if fake:
+        SECURITY = os.path.join(home, 'fake_security.py')
+        KC_DB = os.path.join(home, 'fake-keychain.json')
+        with open(SECURITY, 'w') as f:
+            f.write(FAKE_SECURITY % sys.executable)
+        os.chmod(SECURITY, 0o755)
+        KC_ENV = dict(os.environ, CS_FAKE_KEYCHAIN=KC_DB)
+    else:
+        SECURITY, KC_DB, KC_ENV = 'security', None, dict(os.environ)
+    atexit.register(kc_cleanup)
+
+
+def kc_cleanup():
+    """Remove the test item from a real keychain, whatever happened."""
+    if STORE == 'keychain' and KC_DB is None:
+        with contextlib.suppress(Exception):
+            sec('delete-generic-password', '-a', KC_ACCOUNT, '-s', KC_SERVICE)
+
+
+def sec(*args, check=False):
+    p = subprocess.run([SECURITY, *args], capture_output=True, timeout=20, env=KC_ENV)
+    if check and p.returncode != 0:
+        raise RuntimeError(f'security {args[0]} failed ({p.returncode}): {p.stderr.decode("utf-8", "replace")}')
+    return p
+
+
+def cfg_path(home):
+    """.claude.json — inside CLAUDE_CONFIG_DIR (<home>/.claude) in keychain mode, in <home> otherwise."""
+    return os.path.join(home, '.claude', '.claude.json') if STORE == 'keychain' else os.path.join(home, '.claude.json')
+
+
+def cred_write(home, cred):
+    """Put a credentials object where cs will look for the login: the login file, or the (stand-in) keychain item."""
+    text = json.dumps(cred, separators=(',', ':'))
+    if STORE == 'file':
+        cp = os.path.join(home, '.claude', '.credentials.json')
+        with open(cp, 'w') as f:
+            f.write(text)
+        os.chmod(cp, 0o600)
+        return
+    sec('add-generic-password', '-U', '-a', KC_ACCOUNT, '-s', KC_SERVICE, '-X', text.encode('utf-8').hex(), check=True)
+    if KC_DB:  # forget how this helper wrote, so last_write_via only records what cs did
+        d = jload(KC_DB)
+        d['last_write_via'] = None
+        with open(KC_DB, 'w') as f:
+            json.dump(d, f)
+
+
+def cred_text(home):
+    """The stored login as text — None when logged out."""
+    if STORE == 'file':
+        try:
+            with open(os.path.join(home, '.claude', '.credentials.json')) as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+    p = sec('find-generic-password', '-a', KC_ACCOUNT, '-w', '-s', KC_SERVICE)
+    return p.stdout.decode('utf-8').rstrip('\n') if p.returncode == 0 else None
+
+
+def cred_read(home):
+    t = cred_text(home)
+    return None if t is None else json.loads(t)
+
+
+def cred_delete(home):
+    if STORE == 'file':
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(os.path.join(home, '.claude', '.credentials.json'))
+        return
+    p = sec('delete-generic-password', '-a', KC_ACCOUNT, '-s', KC_SERVICE)
+    assert p.returncode in (0, 44), p.stderr
 
 
 class State:
@@ -257,15 +438,11 @@ def jload(p):
 
 def write_live(home, email, at, rt, *, expires_in_s=8 * 3600, with_email=True):
     now = int(time.time() * 1000)
-    cred = {'claudeAiOauth': {'accessToken': at, 'refreshToken': rt, 'expiresAt': now + expires_in_s * 1000,
-                              'scopes': ['user:inference', 'user:profile'], 'subscriptionType': 'max',
-                              'rateLimitTier': 'default_claude_max_20x', 'refreshTokenExpiresAt': now + 28 * 86400000,
-                              'subscriptionTypeSource': 'sign_in'}}
-    cp = os.path.join(home, '.claude', '.credentials.json')
-    with open(cp, 'w') as f:
-        f.write(json.dumps(cred, separators=(',', ':')))
-    os.chmod(cp, 0o600)
-    cfgp = os.path.join(home, '.claude.json')
+    cred_write(home, {'claudeAiOauth': {'accessToken': at, 'refreshToken': rt, 'expiresAt': now + expires_in_s * 1000,
+                                        'scopes': ['user:inference', 'user:profile'], 'subscriptionType': 'max',
+                                        'rateLimitTier': 'default_claude_max_20x', 'refreshTokenExpiresAt': now + 28 * 86400000,
+                                        'subscriptionTypeSource': 'sign_in'}})
+    cfgp = cfg_path(home)
     cfg = jload(cfgp) if os.path.exists(cfgp) else {'numStartups': 7, 'projects': {'/home/x': {'allowedTools': []}}}
     if with_email:
         cfg['oauthAccount'] = {'accountUuid': 'u-' + email, 'emailAddress': email, 'displayName': email.split('@')[0]}
@@ -277,18 +454,15 @@ def write_live(home, email, at, rt, *, expires_in_s=8 * 3600, with_email=True):
 
 
 def write_cred_only(home, at, rt, *, sub='max', tier='default_claude_max_20x'):
-    """Only the login file changes, like when Claude refreshes its own token (.claude.json stays)."""
+    """Only the stored login changes, like when Claude refreshes its own token (.claude.json stays)."""
     now = int(time.time() * 1000)
-    cp = os.path.join(home, '.claude', '.credentials.json')
-    with open(cp, 'w') as f:
-        f.write(json.dumps({'claudeAiOauth': {'accessToken': at, 'refreshToken': rt, 'expiresAt': now + 8 * 3600000,
-                                              'scopes': ['user:inference', 'user:profile'], 'subscriptionType': sub,
-                                              'rateLimitTier': tier}}, separators=(',', ':')))
-    os.chmod(cp, 0o600)
+    cred_write(home, {'claudeAiOauth': {'accessToken': at, 'refreshToken': rt, 'expiresAt': now + 8 * 3600000,
+                                        'scopes': ['user:inference', 'user:profile'], 'subscriptionType': sub,
+                                        'rateLimitTier': tier}})
 
 
 def live(home):
-    return jload(os.path.join(home, '.claude', '.credentials.json'))['claudeAiOauth']
+    return cred_read(home)['claudeAiOauth']
 
 
 def vault(home, email):
@@ -310,23 +484,45 @@ def vault_find(home, email, org):
     return None, None
 
 
-def main():
+def main(store='file', fake_security=True):
+    global STORE
+    STORE = store
     srv = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f'http://127.0.0.1:{srv.server_port}'
     home = tempfile.mkdtemp(prefix='cs-home-')
     os.makedirs(os.path.join(home, '.claude'))
+    if STORE == 'keychain':
+        kc_setup(home, fake_security)
+    print(f'login store: {STORE}' + (f' · security tool: {SECURITY} · service: {KC_SERVICE}' if STORE == 'keychain' else ''))
     fake = os.path.join(home, 'fake_claude.py')
     login_file = os.path.join(home, 'next_login.json')
+    store_code = (
+        "def read_cred():\n"
+        "    try:\n"
+        "        return json.load(open(CP))\n"
+        "    except FileNotFoundError:\n"
+        "        return {}\n"
+        "def write_cred(c):\n"
+        "    open(CP, 'w').write(json.dumps(c, separators=(',', ':')))\n"
+        if STORE == 'file' else
+        "import subprocess\n"
+        "def read_cred():\n"
+        "    p = subprocess.run([SEC, 'find-generic-password', '-a', ACCT, '-w', '-s', SVC], capture_output=True)\n"
+        "    return json.loads(p.stdout.decode('utf-8').strip()) if p.returncode == 0 else {}\n"
+        "def write_cred(c):\n"
+        "    subprocess.run([SEC, 'add-generic-password', '-U', '-a', ACCT, '-s', SVC, '-X', json.dumps(c, separators=(',', ':')).encode('utf-8').hex()], check=True)\n")
     with open(fake, 'w') as f:
         f.write(f'''#!{sys.executable}
 import json, os
+CP = os.path.join(os.environ['HOME'], '.claude', '.credentials.json')
+SEC, ACCT, SVC = {SECURITY!r}, {KC_ACCOUNT!r}, {KC_SERVICE!r}
+{store_code}
 d = json.load(open({login_file!r}))
-cp = os.path.join(os.environ['HOME'], '.claude', '.credentials.json')
-cred = json.load(open(cp)) if os.path.exists(cp) else {{}}
+cred = read_cred()
 cred['claudeAiOauth'] = {{'accessToken': d['at'], 'refreshToken': d['rt'], 'expiresAt': d['exp'], 'scopes': ['user:inference', 'user:profile'], 'subscriptionType': d.get('sub', 'max'), 'rateLimitTier': d.get('tier', 'default_claude_max_20x')}}
-open(cp, 'w').write(json.dumps(cred, separators=(',', ':')))
-cfgp = os.path.join(os.environ['HOME'], '.claude.json')
+write_cred(cred)
+cfgp = os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or os.environ['HOME'], '.claude.json')
 cfg = json.load(open(cfgp))
 acct = {{'accountUuid': 'u-' + d['email'], 'emailAddress': d['email']}}
 if d.get('org'):
@@ -337,7 +533,12 @@ print('Login successful.')
 ''')
     os.chmod(fake, 0o755)
     env = dict(os.environ, HOME=home, CS_API_BASE=base, CS_TOKEN_URL=base + '/v1/oauth/token',
-               CS_CLAUDE_BIN=fake, CS_LOCK_WAIT='2', NO_COLOR='1')
+               CS_CLAUDE_BIN=fake, CS_LOCK_WAIT='2', NO_COLOR='1', CS_CRED_STORE=STORE)
+    if STORE == 'keychain':  # the CLI with CLAUDE_CONFIG_DIR set: .claude.json and the locks move there, the keychain service gets a suffix
+        env.update(CLAUDE_CONFIG_DIR=os.path.join(home, '.claude'), CS_SECURITY_BIN=SECURITY)
+        if KC_DB:
+            env['CS_FAKE_KEYCHAIN'] = KC_DB
+    cred_file = os.path.join(home, '.claude', '.credentials.json')
     outputs = []
 
     def run(*args):
@@ -402,15 +603,20 @@ print('Login successful.')
     print(p.stdout + p.stderr)
     check(p.returncode == 0 and '✓ switched to jay' in p.stdout, 'switch message')
     check(live(home)['refreshToken'] == rt_a and live(home)['accessToken'] == at_a, 'login file = jay token')
-    cfg = jload(os.path.join(home, '.claude.json'))
+    cfg = jload(cfg_path(home))
     check(cfg['oauthAccount']['emailAddress'] == A and cfg.get('numStartups') == 7 and 'projects' in cfg, '.claude.json account = jay · other keys kept')
-    raw = open(os.path.join(home, '.claude.json')).read()
+    raw = open(cfg_path(home)).read()
     check('\n  "' in raw and not raw.endswith('\n'), '.claude.json keeps indent 2 · no trailing newline')
-    check('\n' not in open(os.path.join(home, '.claude', '.credentials.json')).read(), 'login file stays single-line JSON')
-    check(oct(os.stat(os.path.join(home, '.claude', '.credentials.json')).st_mode & 0o777) == '0o600', 'login file is 600')
+    if STORE == 'file':
+        check('\n' not in cred_text(home), 'login file stays single-line JSON')
+        check(oct(os.stat(cred_file).st_mode & 0o777) == '0o600', 'login file is 600')
+    else:
+        check('\n' not in cred_text(home), 'keychain item stays single-line JSON')
+        check(not os.path.exists(cred_file), 'no .credentials.json was written next to the keychain')
     backups = sorted(os.listdir(os.path.join(home, '.claude-accounts', 'backup')))
     check(backups and jload(os.path.join(home, '.claude-accounts', 'backup', backups[-1]))['credentials']['claudeAiOauth']['refreshToken'] == rt_b, 'the outgoing login (joe) was backed up')
-    check(not os.path.exists(lock) and not os.path.exists(home + '/.claude.lock') and not os.path.exists(home + '/.claude.json.lock'), 'all locks released')
+    check(not os.path.exists(lock) and not os.path.exists(home + '/.claude.lock') and not os.path.exists(cfg_path(home) + '.lock')
+          and not os.path.exists(os.path.join(home, '.claude', '.storage-write.lock')), 'all locks released')
     check(S.refresh_calls == 0, '0 refresh calls (token still valid)')
 
     print('S4 idle joe token expires → cs refreshes (rotates) it and stores the result')
@@ -447,6 +653,17 @@ print('Login successful.')
     check(p.returncode == 0 and live(home)['refreshToken'] == vault(home, B)['claudeAiOauth']['refreshToken'], 'stale lock removed · switched to joe')
     check(not os.path.exists(lock), 'lock released')
     check(vault(home, A)['claudeAiOauth']['refreshToken'] == rt_a2, 'outgoing jay stored with its newest token')
+    slock = os.path.join(home, '.claude', '.storage-write.lock')  # the CLI's secure-storage write lock (stale after 15 s)
+    os.mkdir(slock)
+    p = run('jay')
+    check(p.returncode == 1 and 'saving its login' in p.stderr and live(home)['refreshToken'] == vault(home, B)['claudeAiOauth']['refreshToken'],
+          'storage-write lock held → no switch, explanation')
+    old = time.time() - 30
+    os.utime(slock, (old, old))
+    p = run('jay')
+    check(p.returncode == 0 and live(home)['refreshToken'] == rt_a2 and not os.path.exists(slock), 'stale storage-write lock removed · switched to jay')
+    p = run('joe')
+    check(p.returncode == 0 and live(home)['refreshToken'] == vault(home, B)['claudeAiOauth']['refreshToken'], 'back on joe')
 
     print('S7 plain terminal (TERM=dumb) → number prompt instead of the live screen')
     rc, out = run_tty('1')
@@ -481,12 +698,12 @@ print('Login successful.')
     S.profile_fail = False
 
     print('S10 logged out → cs jay restores the login')
-    os.unlink(os.path.join(home, '.claude', '.credentials.json'))
+    cred_delete(home)
     p = run('jay')
     print(p.stdout + p.stderr)
     check(p.returncode == 0 and live(home)['refreshToken'] == rt_a2, 'jay login restored')
 
-    cfgp = os.path.join(home, '.claude.json')
+    cfgp = cfg_path(home)
     hour8 = lambda: int(time.time() * 1000) + 8 * 3600000  # noqa: E731
 
     print('S11 team seat of the same email (jay) — cs add → stored separately · personal jay untouched')
@@ -639,7 +856,7 @@ print('Login successful.')
     tenv = {k: v for k, v in env.items() if k != 'NO_COLOR'}  # colours on (including the inverted cursor row)
     tenv.update(TERM='xterm-256color', CS_INTERVAL='1', CS_IDLE_INTERVAL='4', CS_LIMIT_BACKOFF='30')
     locks = [os.path.join(home, '.claude', '.oauth_refresh.lock'), os.path.join(home, '.claude.lock'),
-             os.path.join(home, '.claude.json.lock')]
+             cfg_path(home) + '.lock', os.path.join(home, '.claude', '.storage-write.lock')]
     rt_jay = lambda: vault_find(home, A, 'o-' + A)[1]['claudeAiOauth']['refreshToken']  # noqa: E731
     rt_team = lambda: vault_find(home, A, ORG_T)[1]['claudeAiOauth']['refreshToken']  # noqa: E731
     rt_dean = lambda: vault(home, C)['claudeAiOauth']['refreshToken']  # noqa: E731
@@ -1011,11 +1228,83 @@ print('Login successful.')
         shutil.rmtree(tdir, ignore_errors=True)
         outputs.extend(x.raw.decode('utf-8', 'replace') for x in (k1, k2))
 
+    if STORE == 'keychain':
+        rt_now = lambda: live(home)['refreshToken']  # noqa: E731
+        p = run('jay')
+        check(p.returncode == 0, 'start on jay')
+
+        print('K1 keychain + a leftover .credentials.json — the keychain wins · a switch rewrites the file too (mtime bumped)')
+        with open(cred_file, 'w') as f:
+            f.write(json.dumps({'claudeAiOauth': dict(vault(home, C)['claudeAiOauth'])}, indent=2) + '\n')  # dean's token in the file
+        os.chmod(cred_file, 0o600)
+        old = time.time() - 600
+        os.utime(cred_file, (old, old))
+        p = run('ls')
+        print(p.stdout)
+        check(re.search(r'▶\s+\d+\s+jay\s', p.stdout) is not None, '▶ = jay from the keychain, not dean from the file')
+        p = run('dean')
+        print(p.stdout + p.stderr)
+        check(p.returncode == 0 and rt_now() == rt_dean(), 'switched to dean (keychain)')
+        check(jload(cred_file)['claudeAiOauth']['refreshToken'] == rt_dean() and os.stat(cred_file).st_mtime > old + 1,
+              'the file holds dean too · its mtime was bumped (a running CLI watches it)')
+        raw = open(cred_file).read()
+        check('\n  "' in raw and raw.endswith('\n'), 'the file keeps its own formatting (indent 2 · trailing newline)')
+        check('within about 30 seconds' in p.stdout, 'switch message: running sessions follow within about 30 seconds')
+        os.unlink(cred_file)
+
+        print('K2 keychain empty but the file holds a login (the CLI fallback) — cs reads the file · a switch fills the keychain and the file')
+        cred_delete(home)
+        with open(cred_file, 'w') as f:
+            f.write(json.dumps({'claudeAiOauth': dict(vault(home, C)['claudeAiOauth'])}, separators=(',', ':')))
+        os.chmod(cred_file, 0o600)
+        p = run('ls')
+        print(p.stdout)
+        check(re.search(r'▶\s+\d+\s+dean\s', p.stdout) is not None and 'current login' in p.stdout, '▶ = dean from the file')
+        p = run('jay')
+        check(p.returncode == 0 and rt_now() == rt_jay() and jload(cred_file)['claudeAiOauth']['refreshToken'] == rt_jay(),
+              'keychain = jay · file = jay')
+        os.unlink(cred_file)
+        check(rt_now() == rt_jay(), 'the keychain alone still says jay')
+
+        print('K3 a credentials object with extra keys and a long payload — extra keys kept · long items go as arguments')
+        cred = cred_read(home)
+        cred['_cs_test_pad'] = 'x' * 2500  # hex-encoded this is longer than the security -i line limit (4032)
+        cred_write(home, cred)
+        p = run('dean')
+        item = cred_read(home)
+        check(p.returncode == 0 and item['claudeAiOauth']['refreshToken'] == rt_dean() and item.get('_cs_test_pad') == 'x' * 2500,
+              'switched · the extra key survived')
+        if KC_DB:
+            check(jload(KC_DB).get('last_write_via') == 'argv', 'the long item was written through arguments')
+        item.pop('_cs_test_pad')
+        cred_write(home, item)
+        p = run('jay')
+        check(p.returncode == 0 and rt_now() == rt_jay(), 'switched back')
+        if KC_DB:
+            check(jload(KC_DB).get('last_write_via') == 'stdin', 'a short item goes through security -i')
+
+        if KC_DB:
+            print('K4 locked keychain (security exits 36) — clear message · nothing changed · a missing security tool is reported')
+            open(KC_DB + '.locked', 'w').close()
+            p = run('dean')
+            print(p.stderr)
+            check(p.returncode == 1 and 'keychain is locked' in p.stderr and 'unlock-keychain' in p.stderr, 'cs dean → locked message')
+            p = run('ls')
+            check(p.returncode == 1 and 'keychain is locked' in p.stderr, 'cs ls → locked message')
+            os.unlink(KC_DB + '.locked')
+            check(rt_now() == rt_jay(), 'login unchanged')
+            p = subprocess.run([sys.executable, '-I', CS, 'ls'], env=dict(env, CS_SECURITY_BIN='/nonexistent/security'),
+                               capture_output=True, text=True, timeout=60)
+            outputs.append(p.stdout + p.stderr)
+            check(p.returncode == 1 and 'was not found' in p.stderr, 'missing security tool → message')
+
     print('S33 no token ever appears in the output')
     blob = '\n'.join(outputs)
     check(not any(t in blob for t in S.issued), '0 token strings')
 
     srv.shutdown()
+    if STORE == 'keychain':
+        cred_delete(home)
     shutil.rmtree(home, ignore_errors=True)
     print()
     print('FAIL:', FAILS) if FAILS else print('all passed')
@@ -1023,4 +1312,24 @@ print('Login successful.')
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    store = 'keychain' if sys.platform == 'darwin' else 'file'
+    fake_sec = sys.platform != 'darwin'
+    args, i = sys.argv[1:], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith('--store='):
+            store = a.split('=', 1)[1]
+        elif a == '--store' and i + 1 < len(args):
+            store = args[i + 1]
+            i += 1
+        elif a == '--fake-security':
+            fake_sec = True
+        elif a == '--real-security':
+            fake_sec = False
+        else:
+            print(__doc__)
+            sys.exit(2)
+        i += 1
+    if store not in ('file', 'keychain'):
+        sys.exit('--store must be file or keychain')
+    sys.exit(main(store, fake_sec))

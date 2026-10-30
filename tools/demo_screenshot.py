@@ -60,7 +60,8 @@ def seed(home, base):
 
 def capture(home, base, cols=118, rows=34):
     env = dict(os.environ, HOME=home, CS_API_BASE=base, CS_TOKEN_URL=base + '/v1/oauth/token', TERM='xterm-256color',
-               CS_INTERVAL='1', CS_IDLE_INTERVAL='4', CS_AUTO_COOLDOWN='1', TZ='Asia/Seoul')
+               CS_INTERVAL='1', CS_IDLE_INTERVAL='4', CS_AUTO_COOLDOWN='1', TZ='Asia/Seoul',
+               CS_CRED_STORE='file')  # the seeded login is a file, also on macOS
     env.pop('NO_COLOR', None)
     t = T.Tui(env, cols=cols, rows=rows)
     t.wait(lambda f: 'auto-switch: carol → alice' in f and 'when it runs low' in f, 30)

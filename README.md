@@ -42,9 +42,12 @@ comes first keeps the most usable quota alive across all accounts.
 
   It never moves onto an account with extra usage enabled (that one bills instead of blocking) or onto
   one with ≤5 % left. Every move is logged to `~/.claude-accounts/auto-switch.log`.
-- **Safe switching** — the login file is swapped under the same locks the Claude CLI uses, the outgoing
+- **Safe switching** — the stored login is swapped under the same locks the Claude CLI uses, the outgoing
   login is backed up first, the token of the account in use is never refreshed (refresh tokens are
   single-use), and nothing is written when the current login cannot be identified.
+- **Linux and macOS** — on Linux the login is `~/.claude/.credentials.json`; on macOS it is the keychain item
+  Claude Code keeps (`Claude Code-credentials`), which `cs` reads and writes with the same `security` commands
+  as the CLI. Everything else (table, live screen, auto-switch, `cs keep`) is identical on both.
 - **`cs add`** replaces `/login`: it stores the current login before starting a new one, so no account
   is lost. Same email in a personal plan and a team? Add it twice and pick the organization in the
   browser — the seat is stored separately as `name-team`.
@@ -58,11 +61,16 @@ the only requirements. No third-party packages.
 
 ```sh
 git clone https://github.com/ruucm/claude-switch.git
-ln -s "$PWD/claude-switch/cs.py" ~/.local/bin/cs   # or anywhere on your PATH
+mkdir -p ~/.local/bin && ln -s "$PWD/claude-switch/cs.py" ~/.local/bin/cs   # or anywhere on your PATH
 cs help
 ```
 
 Linux and macOS (it uses `fcntl`, `termios` and `pty`). On Windows run it inside WSL.
+
+macOS notes: `python3` comes with the Xcode command line tools (`xcode-select --install`) or Homebrew;
+`cs keep` needs tmux (`brew install tmux`); if `~/.local/bin` is not on your `PATH`, add
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`. The first `cs` run reads the keychain item Claude Code
+created — no extra setup, and nothing is copied out of the keychain except into `~/.claude-accounts`.
 
 ## Usage
 
@@ -106,9 +114,10 @@ locally logged token usage; override it with `CS_WEEK_RATIO`.
 | Nowhere to go | stay, ring once, move as soon as an account frees up |
 | Several `cs` screens open | only the one holding `auto.lock` switches; another takes over when it quits |
 
-Switching is cheap: the CLI re-reads its credentials file whenever the file's mtime changes, so a swap
-takes effect on the next request without restarting anything. A response already in flight finishes on
-the account it started with.
+Switching is cheap: on Linux the CLI re-reads its credentials file whenever the file's mtime changes, so a
+swap takes effect on the next request without restarting anything; on macOS the CLI caches keychain reads
+for 30 seconds, so running sessions follow within about half a minute. A response already in flight
+finishes on the account it started with.
 
 ### Configuration
 
@@ -123,21 +132,34 @@ the account it started with.
 | `CS_WEEK_RATIO` | `3.5` | one Max 20x week ÷ one Max/Team 5x week |
 | `CS_VAULT_DIR` | `~/.claude-accounts` | where logins, backups, settings and the log live |
 | `CS_CLAUDE_BIN` | `claude` on PATH | the CLI used by `cs add` |
+| `CS_CRED_STORE` | `keychain` on macOS, `file` elsewhere | where the CLI keeps the login: `file` = `.credentials.json`, `keychain` = the macOS keychain item |
+| `CS_SECURITY_BIN` | `security` | the keychain tool (tests point it at a stand-in) |
+| `CLAUDE_CONFIG_DIR` | unset | honoured like the CLI honours it: moves `.credentials.json`, `.claude.json` and the locks, and suffixes the keychain service name |
 
 Times are shown in the machine's local time zone (`TZ`).
 
 ## How it works
 
-Verified against the Claude CLI binary (2.1.310):
+Verified against the Claude CLI 2.1.310 binaries (Linux x64 and macOS arm64 — the macOS build has the
+keychain code, the Linux build has it compiled out):
 
-- Every `claude` on a machine runs on `~/.claude/.credentials.json`; the account shown in the UI comes
-  from `oauthAccount` in `~/.claude.json`. `cs` keeps a copy of each login in `~/.claude-accounts/accounts/`
-  (directory `700`, files `600`) and swaps the two files.
-- Before each API call the CLI compares the credentials file's mtime and re-reads it when it changed —
-  that is why a swap moves running agents without a restart.
-- Token refresh takes `~/.claude/.oauth_refresh.lock` and `~/.claude.lock`; config saves take
-  `~/.claude.json.lock` (proper-lockfile directory locks). `cs` takes the same locks in the same order and
-  removes stale ones the same way.
+- Every `claude` on a machine runs on one stored login; the account shown in the UI comes from
+  `oauthAccount` in `~/.claude.json`. `cs` keeps a copy of each login in `~/.claude-accounts/accounts/`
+  (directory `700`, files `600`) and swaps the stored login plus `oauthAccount`.
+- **Linux:** the login is `~/.claude/.credentials.json`. Before each API call the CLI compares the file's
+  mtime and re-reads it when it changed — that is why a swap moves running agents without a restart.
+- **macOS:** the login is the login-keychain item with service `Claude Code-credentials` and account
+  `$USER` (`claude-code-user` when the name has characters outside `[A-Za-z0-9._-]`); its data is the
+  same JSON the file would hold. The CLI reads it with `security find-generic-password -a $USER -w -s
+  "Claude Code-credentials"`, writes it with `add-generic-password -U … -X <hex>` (through `security -i`
+  while the command fits its 4 KB line buffer, as arguments otherwise), and caches reads for 30 s.
+  `.credentials.json` is only the fallback the CLI writes when a keychain write fails hard; when it exists
+  the CLI reads the keychain first, and its change check watches that file's mtime instead of the keychain.
+  `cs` therefore writes the keychain item the same way and rewrites a leftover file as well. With
+  `CLAUDE_CONFIG_DIR` set, the service name gets `-<first 8 hex digits of sha256(CLAUDE_CONFIG_DIR)>`.
+- Token refresh takes `~/.claude/.oauth_refresh.lock` and `~/.claude.lock`; every credential write takes
+  `~/.claude/.storage-write.lock`; config saves take `~/.claude.json.lock` (proper-lockfile directory locks).
+  `cs` takes the same locks in the same order and removes stale ones the same way.
 - Refresh tokens rotate: a refresh token is dead after one use. `cs` therefore never refreshes the login
   in use (the CLI will), refreshes idle accounts only when their access token is about to expire, and
   writes the rotated token to the vault immediately.
@@ -160,6 +182,8 @@ Do not use `/logout` inside `claude` — it can invalidate the stored login of t
 ## Caveats
 
 - `~/.claude-accounts` contains login tokens. Keep it on this machine; do not copy or commit it.
+- On macOS the keychain item's access list trusts the `security` tool, so any process running as you can
+  read the login with one command — that is how Claude Code itself works; `cs` adds no new exposure.
 - Idle refresh tokens expire after roughly four weeks of disuse. Running `cs` now and then keeps them alive.
 - Anthropic's consumer terms do not address multiple subscriptions explicitly; rotating accounts to
   work around limits is a grey area. You decide whether that is acceptable for your situation.
@@ -168,14 +192,19 @@ Do not use `/logout` inside `claude` — it can invalidate the stored login of t
 ## Tests
 
 ```sh
-python3 -I test_cs.py   # ~2 minutes
+python3 -I test_cs.py                    # ~2 minutes — the platform's login store (file on Linux, keychain on macOS)
+python3 -I test_cs.py --store keychain   # the keychain path anywhere (on Linux through a stand-in for `security`)
 ```
 
-33 scenarios / 163 checks against a fake `HOME` and a fake API server (token rotation, single-use refresh
-tokens, User-Agent check, per-account reset times, rate limiting, team seats). The live screen is driven
-on a real pty; auto-switch scenarios ramp usage over time to exercise the burn-rate rule; `cs keep` uses a
-private tmux server. Real logins are never touched. `tools/demo_screenshot.py` renders `assets/screenshot.png`
-from the same fake server.
+33 scenarios / 166 checks against a fake `HOME` and a fake API server (token rotation, single-use refresh
+tokens, User-Agent check, per-account reset times, rate limiting, team seats), plus 4 keychain scenarios
+in keychain mode (183 checks in total: the keychain next to a leftover file, the file-only fallback, long
+items, a locked keychain). The live screen is driven on a real pty; auto-switch scenarios ramp usage over time to exercise the
+burn-rate rule; `cs keep` uses a private tmux server. Real logins are never touched: keychain runs use
+`CLAUDE_CONFIG_DIR`, so they address a test-only keychain item that is deleted afterwards. CI runs the file
+mode on Linux, the keychain mode on Linux through the stand-in (Python 3.9), and the keychain mode on macOS
+with the real `security` tool in a throw-away keychain. `tools/demo_screenshot.py` renders
+`assets/screenshot.png` from the same fake server.
 
 ## License
 

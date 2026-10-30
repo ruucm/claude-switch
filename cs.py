@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """cs — Claude subscription accounts: remaining usage at a glance + account switching.
 
-Every `claude` process on this machine (including agents that drive Claude Code) runs on one login:
-~/.claude/.credentials.json. cs keeps a copy of that login per account in ~/.claude-accounts/, shows how much
-of each account's 5-hour and weekly limits is left, and swaps the login file to switch accounts.
+Every `claude` process on this machine (including agents that drive Claude Code) runs on one login — the file
+~/.claude/.credentials.json on Linux, the login keychain item "Claude Code-credentials" on macOS. cs keeps a copy of
+that login per account in ~/.claude-accounts/, shows how much of each account's 5-hour and weekly limits is left, and
+swaps the stored login to switch accounts.
 An account is an email + organization. If the same email has a personal subscription and a Team/Enterprise
 seat, both are kept separately — they show up as e.g. jay and jay-team.
 
@@ -21,9 +22,18 @@ seat, both are kept separately — they show up as e.g. jay and jay-team.
                   sessions (run it again to re-attach)
   cs help         This help
 
-How it works (verified against the Claude CLI 2.1.310 binary):
-- Before each API call the CLI compares the mtime of .credentials.json and re-reads the file when it changed
+How it works (verified against the Claude CLI 2.1.310 binaries — Linux x64 and macOS arm64):
+- Linux: before each API call the CLI compares the mtime of .credentials.json and re-reads the file when it changed
   → swapping the file moves even running agents to the new account from their next request.
+- macOS: the login lives in the login keychain — service "Claude Code-credentials", account = $USER; the CLI reads it with
+  `security find-generic-password … -w` and writes it with `security add-generic-password -U … -X <hex>`.
+  .credentials.json is only the fallback the CLI writes when a keychain write fails hard; when it exists the CLI reads
+  the keychain first and the file second. Keychain reads are cached for 30 s; before each API call the CLI re-checks
+  the keychain (or, when a .credentials.json exists, that file's mtime) → cs writes the keychain item the same way and
+  rewrites a leftover file as well, so running agents follow within about 30 s.
+- Credential writes also take <config dir>/.storage-write.lock (proper-lockfile, stale after 15 s) → so does cs.
+- CLAUDE_CONFIG_DIR moves .credentials.json, .claude.json and the locks, and suffixes the keychain service name with the
+  first 8 hex digits of sha256(CLAUDE_CONFIG_DIR) → cs follows it.
 - Token refresh takes ~/.claude/.oauth_refresh.lock and ~/.claude.lock; config saves take ~/.claude.json.lock
   (proper-lockfile directory locks) → cs takes the same locks in the same order before writing.
 - A refresh token is single-use (rotated) → cs never refreshes the token of the account currently in use.
@@ -43,8 +53,10 @@ import codecs
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
+import pwd
 import queue
 import re
 import select
@@ -64,9 +76,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 HOME = os.path.expanduser('~')
-CLAUDE_DIR = os.path.join(HOME, '.claude')
+CONFIG_DIR_ENV = os.environ.get('CLAUDE_CONFIG_DIR') or ''  # the CLI's config-home override (meant to be an absolute path)
+CLAUDE_DIR = os.path.abspath(CONFIG_DIR_ENV) if CONFIG_DIR_ENV else os.path.join(HOME, '.claude')
 CRED_PATH = os.path.join(CLAUDE_DIR, '.credentials.json')
-CONFIG_PATH = os.path.join(HOME, '.claude.json')
+CONFIG_PATH = os.path.join(CLAUDE_DIR if CONFIG_DIR_ENV else HOME, '.claude.json')  # .claude.json moves into CLAUDE_CONFIG_DIR
 VAULT_DIR = os.environ.get('CS_VAULT_DIR') or os.path.join(HOME, '.claude-accounts')
 ACCOUNTS_DIR = os.path.join(VAULT_DIR, 'accounts')
 BACKUP_DIR = os.path.join(VAULT_DIR, 'backup')
@@ -121,9 +134,10 @@ SETTINGS_PATH = os.path.join(VAULT_DIR, 'settings.json')  # {"autoSwitch": true}
 AUTO_LOCK_PATH = os.path.join(VAULT_DIR, 'auto.lock')      # only the live screen holding this lock switches
 AUTO_LOG_PATH = os.path.join(VAULT_DIR, 'auto-switch.log')
 
-# Same lock paths as the Claude CLI (lri · saveConfigWithLock)
+# Same lock paths as the Claude CLI (lri · saveConfigWithLock · the secure-storage write lock)
 REFRESH_LOCK = os.path.join(CLAUDE_DIR, '.oauth_refresh.lock')
 LEGACY_LOCK = os.path.realpath(CLAUDE_DIR) + '.lock'
+STORAGE_LOCK = os.path.join(CLAUDE_DIR, '.storage-write.lock')  # held by the CLI around every credential write
 CONFIG_LOCK = CONFIG_PATH + '.lock'
 
 DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
@@ -244,6 +258,124 @@ def vault_lock():
         yield
     finally:
         os.close(fd)
+
+
+# ── login store ───────────────────────────────────────────────────────
+# Linux: <config dir>/.credentials.json. macOS: the login keychain item the CLI uses — service "Claude Code-credentials"
+# (plus -<sha256(CLAUDE_CONFIG_DIR)[:8]> when that variable is set), account = $USER, data = the same JSON the file would
+# hold. cs reads and writes it with the same `security` commands as the CLI. CS_CRED_STORE=file|keychain overrides the
+# platform default (tests); CS_SECURITY_BIN points at another security tool (tests).
+
+CRED_STORE = os.environ.get('CS_CRED_STORE') or ('keychain' if sys.platform == 'darwin' else 'file')
+if CRED_STORE not in ('file', 'keychain'):
+    raise SystemExit('CS_CRED_STORE must be "file" or "keychain"')
+SECURITY_BIN = os.environ.get('CS_SECURITY_BIN') or 'security'
+KEYCHAIN_SERVICE = 'Claude Code-credentials' + (
+    '-' + hashlib.sha256(CONFIG_DIR_ENV.encode('utf-8')).hexdigest()[:8] if CONFIG_DIR_ENV else '')
+SECURITY_TIMEOUT = 10       # seconds per security call (the CLI allows 2)
+SECURITY_LINE_MAX = 4032    # longer add-generic-password commands go as arguments instead of through `security -i`
+KC_NOT_FOUND, KC_NO_INTERACTION = 44, 36  # security exit codes: errSecItemNotFound · errSecInteractionNotAllowed (locked)
+
+
+def keychain_account():
+    """The CLI's keychain account name: $USER (else the passwd name); anything outside [A-Za-z0-9._-] → claude-code-user."""
+    name = os.environ.get('USER') or ''
+    if not name:
+        with contextlib.suppress(KeyError, OSError):
+            name = pwd.getpwuid(os.getuid()).pw_name
+    return name if re.fullmatch(r'[a-zA-Z0-9._-]+', name or '') else 'claude-code-user'
+
+
+KEYCHAIN_ACCOUNT = keychain_account()
+
+
+def security(args, stdin=None):
+    """Run the security tool → (exit code, stdout, stderr). Only a missing tool or a hang raises."""
+    try:
+        p = subprocess.run([SECURITY_BIN] + args, input=stdin, capture_output=True, timeout=SECURITY_TIMEOUT)
+    except FileNotFoundError:
+        raise CsError(f'{SECURITY_BIN} was not found — on macOS it is /usr/bin/security; elsewhere run cs with CS_CRED_STORE=file') from None
+    except subprocess.TimeoutExpired:
+        raise CsError(f'the security tool did not answer within {SECURITY_TIMEOUT}s — is the keychain waiting for a password prompt?') from None
+    return p.returncode, p.stdout.decode('utf-8', 'replace'), p.stderr.decode('utf-8', 'replace')
+
+
+def keychain_error(code, err, what):
+    if code == KC_NO_INTERACTION:
+        return CsError(f'the login keychain is locked, so the Claude login cannot be {what} (security exited 36) — '
+                       'unlock it with: security unlock-keychain')
+    detail = err.strip().splitlines()[-1] if err.strip() else ''
+    return CsError(f'could not {what} the keychain item "{KEYCHAIN_SERVICE}" (security exited {code}'
+                   + (f': {detail}' if detail else '') + ')')
+
+
+def keychain_read():
+    """The CLI's keychain item → its text. None when there is no item (exit 44)."""
+    code, out, err = security(['find-generic-password', '-a', KEYCHAIN_ACCOUNT, '-w', '-s', KEYCHAIN_SERVICE])
+    if code == 0:
+        return out.rstrip('\r\n')
+    if code == KC_NOT_FOUND:
+        return None
+    raise keychain_error(code, err, 'read')
+
+
+def keychain_write(text):
+    """add-generic-password -U … -X <hex> like the CLI: through `security -i` while the command fits its line buffer, as
+    arguments otherwise. -U replaces the item in place, so its access list (which trusts `security`) is kept."""
+    hexdata = text.encode('utf-8').hex()
+    line = f'add-generic-password -U -a "{KEYCHAIN_ACCOUNT}" -s "{KEYCHAIN_SERVICE}" -X "{hexdata}"\n'
+    if len(line) <= SECURITY_LINE_MAX:
+        code, _, err = security(['-i'], stdin=line.encode('utf-8'))
+    else:
+        code, _, err = security(['add-generic-password', '-U', '-a', KEYCHAIN_ACCOUNT, '-s', KEYCHAIN_SERVICE, '-X', hexdata])
+    if code != 0:
+        raise keychain_error(code, err, 'write')
+
+
+def parse_cred_text(text):
+    """Keychain text → dict. `security -w` prints data that is not plain text as hex — accept that too."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        try:
+            return json.loads(bytes.fromhex(text.strip()).decode('utf-8'))
+        except ValueError:
+            raise ValueError('keychain item is not JSON') from None
+
+
+def read_cred():
+    """The current login as the CLI finds it → (raw text, dict, source 'keychain' | 'file' | ''). macOS reads the keychain
+    first and the file only when the keychain holds nothing usable — the CLI's own order. Logged out → ('', {}, '')."""
+    if CRED_STORE == 'keychain':
+        text = keychain_read()
+        if text is not None:
+            try:
+                cred = parse_cred_text(text)
+                if isinstance(cred, dict):
+                    return text, cred, 'keychain'
+            except ValueError:
+                pass  # not JSON — the CLI ignores such an item too and falls back to the file
+    try:
+        raw, cred = read_json_retry(CRED_PATH)
+        return raw, (cred if isinstance(cred, dict) else {}), 'file'
+    except FileNotFoundError:
+        return '', {}, ''
+
+
+def write_cred(raw, cred, src):
+    """Store the login where the CLI reads it, keeping the file's formatting. macOS: the keychain item; a .credentials.json
+    that exists as well is rewritten with the same content — a running CLI watches that file's mtime when it exists."""
+    if CRED_STORE == 'keychain':
+        keychain_write(json.dumps(cred, ensure_ascii=False, separators=(',', ':')))
+        if not os.path.exists(CRED_PATH):
+            return
+        if src != 'file':
+            try:
+                with open(CRED_PATH, encoding='utf-8') as f:
+                    raw = f.read()
+            except OSError:
+                raw = ''
+    write_json(CRED_PATH, cred, mode=0o600, indent=2 if '\n' in raw else None, newline=raw.endswith('\n'))
 
 
 # ── API ───────────────────────────────────────────────────────────────
@@ -393,17 +525,15 @@ def label_of(labs, key):
 
 
 def read_live():
-    """→ (raw text, whole credentials file, claudeAiOauth, oauthAccount from ~/.claude.json). Empty when logged out."""
-    try:
-        raw, cred = read_json_retry(CRED_PATH)
-    except FileNotFoundError:
-        raw, cred = '', {}
+    """→ (raw text, whole credentials, claudeAiOauth, oauthAccount from .claude.json, source: 'keychain' | 'file' | '').
+    Empty when logged out."""
+    raw, cred, src = read_cred()
     try:
         _, cfg = read_json_retry(CONFIG_PATH)
         acct = cfg.get('oauthAccount') or {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         acct = {}
-    return raw, cred, cred.get('claudeAiOauth') or {}, acct
+    return raw, cred, cred.get('claudeAiOauth') or {}, acct, src
 
 
 def resolve_key(email, org, entries):
@@ -632,10 +762,21 @@ def pct_text(used):
     return c(f'{p}%', '32' if p >= 50 else ('33' if p >= 20 else '1;31'))
 
 
+ISO_FRAC = re.compile(r'\.(\d+)(?=[+-]\d\d:\d\d$|$)')
+
+
+def parse_iso(iso):
+    """ISO 8601 time from the API → aware datetime. Python before 3.11 only takes 3 or 6 fractional digits — normalise to 6."""
+    s = iso.strip().replace('Z', '+00:00')
+    s = ISO_FRAC.sub(lambda m: '.' + (m.group(1) + '000000')[:6], s)
+    dt = datetime.datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
 def when(iso, with_date):
     if not iso:
         return '?'
-    t = to_minute(datetime.datetime.fromisoformat(iso.replace('Z', '+00:00')).astimezone())
+    t = to_minute(parse_iso(iso).astimezone())
     return f'{t.month}/{t.day} {DAYS[t.weekday()]} {t:%H:%M}' if with_date else f'{t:%H:%M}'
 
 
@@ -649,7 +790,7 @@ def reset_ts(iso):
     if not iso:
         return None
     try:
-        return datetime.datetime.fromisoformat(iso.replace('Z', '+00:00')).timestamp()
+        return parse_iso(iso).timestamp()
     except ValueError:
         return None
 
@@ -979,7 +1120,7 @@ def first_hint(shown, labs, live_key, now_s):
 def prepare():
     """Load the vault, identify the current login and store it (always with the newest token)."""
     entries = load_entries()
-    _, _, oauth, acct = read_live()
+    _, _, oauth, acct, _ = read_live()
     key, verified, prof = identify(oauth, acct, entries)
     capture(entries, oauth, acct, key, verified, prof)
     order_by_reset(entries)  # same order as the last table shown — cs <n> follows that table's numbers
@@ -1061,7 +1202,7 @@ def switch(entries, live_oauth, live_key, target, say=print, show_usage=True):
     busy = 'Claude is refreshing its token right now — try again in a few seconds'
     cfg_note = ''
     with claude_lock(REFRESH_LOCK, 60, busy), claude_lock(LEGACY_LOCK, 60, busy):
-        raw, cred, oauth, acct = read_live()
+        raw, cred, oauth, acct, src = read_live()
         if (oauth.get('refreshToken'), oauth.get('accessToken')) != \
                 (live_oauth.get('refreshToken'), live_oauth.get('accessToken')):
             # Claude rotated its token or someone logged in meanwhile → identify again and store the newest login
@@ -1075,8 +1216,8 @@ def switch(entries, live_oauth, live_key, target, say=print, show_usage=True):
         backup_live(cred, acct)
         new_cred = dict(cred)
         new_cred['claudeAiOauth'] = dict(target['claudeAiOauth'])
-        write_json(CRED_PATH, new_cred, mode=0o600, indent=2 if '\n' in raw else None,
-                   newline=raw.endswith('\n'))
+        with claude_lock(STORAGE_LOCK, 15, 'Claude is saving its login right now — try again in a few seconds'):
+            write_cred(raw, new_cred, src)
         if target.get('oauthAccount'):
             try:
                 with claude_lock(CONFIG_LOCK, 10, 'Claude is saving its config', wait_s=min(10, LOCK_WAIT_S)):
@@ -1093,7 +1234,8 @@ def switch(entries, live_oauth, live_key, target, say=print, show_usage=True):
             say('  ' + usage_line(fetch_usage(target['claudeAiOauth']['accessToken'])))
         except (ApiError, OSError, ValueError):
             pass
-    say(c(f'  every claude process on this machine uses {name} from its next request '
+    follow = 'within about 30 seconds (the CLI caches keychain reads)' if CRED_STORE == 'keychain' else 'from its next request'
+    say(c(f'  every claude process on this machine uses {name} {follow} '
           '(a response already in flight may finish on the previous account).', '2'))
     if plan_kind(target):
         say(c('  this is a team seat — any managed settings or policies set by the team admin apply to this machine while it is in use.', '2'))
@@ -1112,7 +1254,7 @@ def add(email_hint=None):
     print(flush=True)
     rc = subprocess.call([CLAUDE_BIN, 'auth', 'login', '--claudeai'] + (['--email', email_hint] if email_hint else []))
     print()
-    _, _, oauth, _ = read_live()
+    _, _, oauth, _, _ = read_live()
     if oauth.get('refreshToken') == oauth_before.get('refreshToken'):
         print('The login did not change (cancelled or failed) — nothing stored.' + (f' (claude exit code {rc})' if rc else ''))
         return 1 if rc else 0
@@ -2036,6 +2178,8 @@ auto-switch: while a live cs screen is open it keeps the first-in-line account (
 team seats: if an email has both a personal subscription and a team seat, run cs add once more and choose the team when
          the browser asks for an organization. The seat is stored separately as <name>-team; the personal entry stays.
 from another machine:  ssh -t <host> '~/.local/bin/cs'
+macOS:   the login is the keychain item "Claude Code-credentials" (what claude itself uses); cs reads and writes it with the
+         security tool, so running claude sessions follow a switch within about 30 seconds. cs keep needs tmux (brew install tmux).
 vault: ~/.claude-accounts (contains login tokens — do not copy it elsewhere)
 note: never use /logout inside claude — it can invalidate the stored login of that account."""
 
