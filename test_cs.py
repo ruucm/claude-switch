@@ -962,13 +962,27 @@ print('Login successful.')
     check(rc == 0, 'Esc quits')
     S.usage[(C, OC)] = (10, 20, 30)
 
-    print('S22 narrow terminal (80 columns) drops columns · widening brings them back · Ctrl-C quits')
+    print('S22 narrow terminal (80 columns) drops columns but keeps a short Fable column · narrower drops it · widening brings everything back · Ctrl-C quits')
     t = tui(cols=80)
     f = t.wait(four) or ''
     print(f)
-    table = [ln for ln in f.split('\n') if re.match(r'^[❯ ] {2}[▶ ] {2}(\d+|#)', ln) or 'Plan' in ln or 'Total' in ln]
-    check('Fetched' not in f and 'Fable weekly' not in f, 'narrow → Fetched and Fable columns dropped')
-    check(bool(table) and max(dwidth(ln) for ln in table) <= 80, f'table lines fit in 80 columns (max {max([dwidth(x) for x in table] + [0])})')
+
+    def table_of(f):
+        return [ln for ln in f.split('\n') if re.match(r'^[❯ ] {2}[▶ ] {2}(\d+|#)', ln) or 'Plan' in ln or 'Total' in ln]
+
+    def header_width(f):  # the header carries no trailing note, so its width is the table width the layout is fitted on
+        return dwidth(next((ln for ln in table_of(f) if 'Plan' in ln), '').rstrip())
+
+    table = table_of(f)
+    hdr = next((ln for ln in table if 'Plan' in ln), '').rstrip()
+    check('Fetched' not in f and 'Fable weekly' not in f, 'narrow → Fetched dropped · per-model header shortened')
+    check(hdr.endswith('Fable') and '70%' in row_line(f, 'dean'), 'Fable column kept at 80 columns (header · dean 70% left)')
+    w = header_width(f)
+    check(bool(table) and 0 < w <= 80, f'table fits in 80 columns ({w} wide · a trailing note such as ⚠extra may run past the edge)')
+    t.resize(w - 1)
+    f = t.wait(lambda f: 'Fable' not in f and 'Plan' in f, 10) or ''
+    check(0 < header_width(f) <= w - 1 and '70%' not in row_line(f, 'dean'),
+          f'{w - 1} columns → Fable column dropped · table {header_width(f)} wide')
     t.resize(130)
     check(t.wait(lambda f: 'Fetched' in f and 'Fable weekly' in f, 10) is not None, 'widened to 130 → everything back')
     t.send('\x03')

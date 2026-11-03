@@ -960,17 +960,18 @@ def ago(sec):
 
 
 def table_lines(entries, live_key, verified, results, logged_in=True, *, pointer=False, cursor=None,
-                ages=None, compact=False, now_s=None, split=False):
+                ages=None, compact=False, per_model=True, now_s=None, split=False):
     """Table + notes → list of lines. Keeps the entries order — row number = that order.
     The live screen (pointer) adds a ❯ column, inverts the cursor row (account key) and fills the 'Fetched' column from
     ages (key → seconds since fetched). 'Left/Total' = weekly limits on the shared scale (one 20x week = 100) + a Total row.
-    compact = narrow terminal — drops Fetched, per-model weekly, weekday/time of the weekly reset and team organization names.
-    split = return (table lines, note lines) separately — only the table lines are measured against the terminal width."""
+    compact = narrow terminal — drops Fetched, weekday/time of the weekly reset and team organization names, and shortens
+    the per-model weekly column ('Fable weekly' → 'Fable'); per_model=False drops that column too (narrower still).
+    split = return (table lines, note lines, table width) — the width counts the cells only, not a row's trailing note
+    (stale value, rate limit, extra usage), so the columns stay put when such a note comes and goes."""
     labs = labels_for(entries)
     now_s = time.time() if now_s is None else now_s
     shown = shown_rows(entries, results)
-    scoped_name = None if compact else next(
-        (s['scoped'][0][0] for _, _, s, _ in shown if s and s.get('scoped')), None)
+    scoped_name = next((s['scoped'][0][0] for _, _, s, _ in shown if s and s.get('scoped')), None) if per_model else None
     show_age = ages is not None and not compact
     amounts = {ekey(e): week_amount(e, s, now_s) for e, _, s, _ in shown}
     show_amt = any(a is not None for a in amounts.values())
@@ -983,7 +984,7 @@ def table_lines(entries, live_key, verified, results, logged_in=True, *, pointer
     head = ([''] if pointer else []) + ['', '#', 'Account', 'Plan'] \
         + (['Weekly · reset'] + (['Left/Total'] if show_amt else []) + ['5-hour'] if compact
            else ['Weekly left · reset'] + (['Left/Total'] if show_amt else []) + ['5-hour · reset']) \
-        + ([f'{scoped_name} weekly'] if scoped_name else []) + (['Fetched'] if show_age else [])
+        + ([scoped_name if compact else f'{scoped_name} weekly'] if scoped_name else []) + (['Fetched'] if show_age else [])
     sep = '/' if compact else ' / '
     rows = []
     for i, (e, r, s, tail) in enumerate(shown, 1):
@@ -1030,6 +1031,7 @@ def table_lines(entries, live_key, verified, results, logged_in=True, *, pointer
     for _, cells, _ in rows:
         for j, x in enumerate(cells):
             widths[j] = max(widths[j], dwidth(x))
+    table_w = sum(widths) + 2 * (len(head) - 1)  # cells and separators — a row's trailing note is not counted
     grid = ['  '.join(pad(c(h, '2'), widths[j]) for j, h in enumerate(head)).rstrip()]
     for k, cells, tail in rows:
         line = '  '.join(pad(x, widths[j]) for j, x in enumerate(cells))
@@ -1056,14 +1058,15 @@ def table_lines(entries, live_key, verified, results, logged_in=True, *, pointer
     for e in entries:
         if e.get('warn'):
             lines.append(c(f'⚠ {labs[ekey(e)]}: {e["warn"]}', '33'))
-    return (grid, lines) if split else grid + lines
+    return (grid, lines, table_w) if split else grid + lines
 
 
 def fitted_table(cols, *args, **kw):
-    """Table that fits the terminal — wide layout first, compact when the table lines overflow. → (table lines, notes)"""
-    for compact in (False, True):
-        grid, notes = table_lines(*args, compact=compact, split=True, **kw)
-        if compact or max(dwidth(x) for x in grid) <= cols:
+    """Table that fits the terminal — wide layout first, then compact, then compact without the per-model weekly column.
+    Measured on the cells only (see table_lines): a trailing note may wrap, the columns stay put. → (table lines, notes)"""
+    for compact, per_model in ((False, True), (True, True), (True, False)):
+        grid, notes, width = table_lines(*args, compact=compact, per_model=per_model, split=True, **kw)
+        if width <= cols or (compact and not per_model):
             return grid, notes
 
 

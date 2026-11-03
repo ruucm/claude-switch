@@ -95,7 +95,7 @@ From another machine: `ssh -t host '~/.local/bin/cs'`.
 | `Weekly left · reset` | % of the weekly limit left, time until it resets, and the weekday/time |
 | `Left/Total` | the weekly limit on a shared scale: one Max 20x week = 100, a 5x seat ≈ 29 (see below) |
 | `5-hour · reset` | % of the 5-hour window left and when it resets |
-| `<model> weekly` | a per-model weekly limit when the API reports one (e.g. Fable) |
+| `<model> weekly` | a per-model weekly limit when the API reports one (e.g. Fable). On a narrow terminal the header shrinks to the model name; the column only goes when even that does not fit |
 | `Fetched` | how old the row's numbers are (live screen only) |
 | `→ Use first` | the top usable account — the one whose remaining weekly quota disappears first |
 
